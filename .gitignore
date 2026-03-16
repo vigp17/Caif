@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+.env
+*.pt
+*.bin
+*.safetensors
+data/raw/*
+data/processed/*
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+wandb/
+outputs/
+venv/
