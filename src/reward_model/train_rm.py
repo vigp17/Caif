@@ -49,17 +49,16 @@ class RewardModel(nn.Module):
         device = next(backbone.parameters()).device
         dtype = next(backbone.parameters()).dtype
         self.reward_head = nn.Linear(hidden_size, 1, bias=False).to(device=device, dtype=dtype)
-
+    
     def forward(self, input_ids, attention_mask):
         outputs = self.backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-        )
-        # Use last token's hidden state as the reward signal
-        last_hidden = outputs.hidden_states[-1][:, -1, :]
-        reward = self.reward_head(last_hidden).squeeze(-1)
-        return reward
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+    )
+    last_hidden = outputs.hidden_states[-1][:, -1, :].float()  # cast to float32
+    reward = self.reward_head(last_hidden.to(self.reward_head.weight.dtype)).squeeze(-1).float()
+    return reward
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
 
