@@ -21,7 +21,6 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
-import wandb
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -29,7 +28,6 @@ BASE_MODEL_ID = "microsoft/Phi-3-mini-4k-instruct"
 SFT_MODEL_PATH = "outputs/sft/final"
 PAIRS_FILE = "data/processed/preference_pairs.jsonl"
 OUTPUT_DIR = "outputs/reward_model"
-WANDB_MODE = os.environ.get("WANDB_MODE", "disabled")
 
 SYSTEM_PROMPT = (
     "You are a financial education assistant. You provide clear, accurate, "
@@ -40,24 +38,24 @@ SYSTEM_PROMPT = (
 # ── Reward Model ──────────────────────────────────────────────────────────────
 
 class RewardModel(nn.Module):
-    """SFT backbone + scalar head."""
+    """SFT backbone (frozen) + float32 scalar head."""
 
     def __init__(self, backbone):
         super().__init__()
         self.backbone = backbone
         hidden_size = backbone.config.hidden_size
-        self.reward_head = nn.Linear(hidden_size, 1, bias=False)
+        # Always float32, always on cuda
+        self.reward_head = nn.Linear(hidden_size, 1, bias=False).cuda().float()
 
     def forward(self, input_ids, attention_mask):
-        outputs = self.backbone(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            output_hidden_states=True,
-        )
-        # Cast to float32 to avoid NaN from float16
-        last_hidden = outputs.hidden_states[-1][:, -1, :].to(torch.float32)
-        # Move reward head to float32
-        self.reward_head = self.reward_head.to(torch.float32)
+        with torch.cuda.amp.autocast(enabled=False):
+            outputs = self.backbone(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                output_hidden_states=True,
+            )
+        # Last token hidden state, cast to float32
+        last_hidden = outputs.hidden_states[-1][:, -1, :].float()
         reward = self.reward_head(last_hidden).squeeze(-1)
         return reward
 
@@ -133,23 +131,18 @@ def main(smoke_test: bool = False):
     print("Loading SFT backbone...")
     base_model = AutoModelForCausalLM.from_pretrained(
         BASE_MODEL_ID,
-        dtype=torch.float16 if device == "cuda" else torch.float32,
+        dtype=torch.float16,
         attn_implementation="eager",
-        device_map="auto" if device == "cuda" else None,
+        device_map="auto",
     )
     backbone = PeftModel.from_pretrained(base_model, SFT_MODEL_PATH)
 
+    # Freeze backbone
+    for param in backbone.parameters():
+        param.requires_grad = False
+
     # Wrap with reward head
     model = RewardModel(backbone)
-    if device != "cuda":
-        model = model.to(device)
-
-    # Only train the reward head + LoRA params
-    for name, param in model.named_parameters():
-        if "reward_head" in name or "lora" in name:
-            param.requires_grad = True
-        else:
-            param.requires_grad = False
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable params: {trainable:,}")
@@ -160,9 +153,9 @@ def main(smoke_test: bool = False):
     train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=4)
 
-    # Optimizer
+    # Optimizer — only reward head
     optimizer = torch.optim.AdamW(
-        filter(lambda p: p.requires_grad, model.parameters()),
+        model.reward_head.parameters(),
         lr=1e-4,
         weight_decay=0.01,
     )
@@ -170,7 +163,6 @@ def main(smoke_test: bool = False):
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     best_val_loss = float("inf")
 
-    # Training loop
     num_epochs = 1 if smoke_test else 3
     for epoch in range(num_epochs):
         model.train()
@@ -186,13 +178,13 @@ def main(smoke_test: bool = False):
             good_scores = model(good_ids, good_mask)
             bad_scores = model(bad_ids, bad_mask)
 
-            # Bradley-Terry loss
-            diff = (good_scores - bad_scores).clamp(-10, 10)  # prevent overflow
+            # Bradley-Terry loss with clamp to prevent overflow
+            diff = (good_scores - bad_scores).clamp(-10, 10)
             loss = -torch.log(torch.sigmoid(diff) + 1e-8).mean()
 
             optimizer.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.reward_head.parameters(), 1.0)
             optimizer.step()
 
             train_loss += loss.item()
@@ -216,7 +208,8 @@ def main(smoke_test: bool = False):
                 good_scores = model(good_ids, good_mask)
                 bad_scores = model(bad_ids, bad_mask)
 
-                loss = -torch.log(torch.sigmoid(good_scores - bad_scores)).mean()
+                diff = (good_scores - bad_scores).clamp(-10, 10)
+                loss = -torch.log(torch.sigmoid(diff) + 1e-8).mean()
                 val_loss += loss.item()
                 val_acc += (good_scores > bad_scores).float().mean().item()
 
@@ -227,7 +220,7 @@ def main(smoke_test: bool = False):
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save(model.state_dict(), f"{OUTPUT_DIR}/best_rm.pt")
+            torch.save(model.reward_head.state_dict(), f"{OUTPUT_DIR}/best_rm.pt")
             print(f"  → Saved best model (val_loss={val_loss:.4f})")
 
     print(f"\nDone. Best reward model saved to {OUTPUT_DIR}/best_rm.pt")
