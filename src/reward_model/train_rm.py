@@ -41,23 +41,24 @@ SYSTEM_PROMPT = (
 
 class RewardModel(nn.Module):
     """SFT backbone + scalar head."""
-    
+
     def __init__(self, backbone):
         super().__init__()
         self.backbone = backbone
         hidden_size = backbone.config.hidden_size
-        device = next(backbone.parameters()).device
-        dtype = next(backbone.parameters()).dtype
-        self.reward_head = nn.Linear(hidden_size, 1, bias=False).to(device=device, dtype=dtype)
-    
+        self.reward_head = nn.Linear(hidden_size, 1, bias=False)
+
     def forward(self, input_ids, attention_mask):
         outputs = self.backbone(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        output_hidden_states=True,
-    )
-        last_hidden = outputs.hidden_states[-1][:, -1, :].float()  # cast to float32
-        reward = self.reward_head(last_hidden.to(self.reward_head.weight.dtype)).squeeze(-1).float()
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+        )
+        # Cast to float32 to avoid NaN from float16
+        last_hidden = outputs.hidden_states[-1][:, -1, :].to(torch.float32)
+        # Move reward head to float32
+        self.reward_head = self.reward_head.to(torch.float32)
+        reward = self.reward_head(last_hidden).squeeze(-1)
         return reward
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
@@ -186,7 +187,8 @@ def main(smoke_test: bool = False):
             bad_scores = model(bad_ids, bad_mask)
 
             # Bradley-Terry loss
-            loss = -torch.log(torch.sigmoid(good_scores - bad_scores)).mean()
+            diff = (good_scores - bad_scores).clamp(-10, 10)  # prevent overflow
+            loss = -torch.log(torch.sigmoid(diff) + 1e-8).mean()
 
             optimizer.zero_grad()
             loss.backward()
