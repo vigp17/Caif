@@ -64,7 +64,10 @@ def load_policy_model(device: str):
         attn_implementation="eager",
         device_map="auto",
     )
-    model = PeftModel.from_pretrained(base, SFT_MODEL_PATH)
+    model = PeftModel.from_pretrained(base, SFT_MODEL_PATH, is_trainable=True)
+    for name, param in model.named_parameters():
+        if "lora" in name.lower():
+            param.requires_grad = True
     model.train()
     return model
 
