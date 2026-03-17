@@ -47,6 +47,9 @@ class RewardModel(nn.Module):
         self.backbone = backbone
         hidden_size = backbone.config.hidden_size
         self.reward_head = nn.Linear(hidden_size, 1, bias=False)
+        # Move reward head to same device as backbone
+        device = next(backbone.parameters()).device
+        self.reward_head = self.reward_head.to(device)
 
     def forward(self, input_ids, attention_mask):
         outputs = self.backbone(
