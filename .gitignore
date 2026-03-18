@@ -11,3 +11,5 @@ data/processed/*
 wandb/
 outputs/
 venv/
+.DS_Store
+*.log
